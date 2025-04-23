@@ -23,7 +23,7 @@ import numpy as np
 import h5py
 import cv2
 import time
-import Queue
+import queue as Queue
 import multiprocessing as mp
 from interfaces.caer import DVS_SHAPE, unpack_header, unpack_data
 

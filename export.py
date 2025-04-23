@@ -10,7 +10,7 @@ GNU LESSER GENERAL PUBLIC LICENSE Version 3.
 
 from __future__ import print_function
 import os, sys, time, argparse
-import Queue
+import queue as Queue
 import numpy as np
 import h5py
 from copy import deepcopy

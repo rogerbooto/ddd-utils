@@ -25,11 +25,12 @@ import cv2
 import time
 import queue as Queue
 import multiprocessing as mp
+from collections import deque
 from interfaces.caer import DVS_SHAPE, unpack_header, unpack_data
 
 CHUNK_SIZE = 128
 
-DISPLAY = True # whether to turn on display. setting DISPLAY=False makes our lives easier in headless servers
+DISPLAY = False # whether to turn on display. setting DISPLAY=False makes our lives easier in headless servers
 
 #  exported_h5_path = os.path.join(
 #      os.environ["HOME"], "data", "DDD19", "exported.h5")
@@ -64,9 +65,326 @@ VIEW_DATA = {
 # this changed in version 3
 CV_AA = cv2.LINE_AA if int(cv2.__version__[0]) > 2 else cv2.CV_AA
 
+def raster_evts(data):
+    """
+    Bin polarity events into a 2D voxel grid:
+      data[:,0] = timestamps (µs)
+      data[:,1] = y coordinates
+      data[:,2] = x coordinates
+      data[:,3] = polarity (0 or 1)
+    Returns an int16 array of shape DVS_SHAPE with (on − off) counts.
+    """
+    _histrange = [(0, v) for v in DVS_SHAPE]
+    pol_on  = data[:,3] == 1
+    pol_off = ~pol_on
+    img_on, _, _  = np.histogram2d(
+        data[pol_on, 2], data[pol_on, 1],
+        bins=DVS_SHAPE, range=_histrange
+    )
+    img_off, _, _ = np.histogram2d(
+        data[pol_off,2], data[pol_off,1],
+        bins=DVS_SHAPE, range=_histrange
+    )
+    return (img_on - img_off).astype(np.int16)
+
+
+import os
+import numpy as np
+import h5py
+import queue as Queue
+from interfaces.caer import DVS_SHAPE, unpack_data
+# … other imports …
+
+def export_sequence(
+    input_path: str,
+    out_path: str = None,
+    binsize: float = 0.1,
+    export_aps: bool = True,
+    export_dvs: bool = True,
+    display: bool = False,
+    in_memory: bool = False,
+    tstart: float = 0.0,
+    tstop: float = None
+):
+    """
+    Three modes:
+      * display=True        → live OpenCV viewer, no on-disk/output
+      * in_memory=True      → collect into RAM and return arrays
+      * neither (default)   → write an HDF5 to out_path and return its path
+    """
+    global DISPLAY
+    DISPLAY = bool(display)
+
+    if out_path is None:
+        out_path = input_path + ".exported.hdf5"
+
+    # open streams
+    f_in = HDF5Stream(input_path, VIEW_DATA)
+    m    = MergedStream(f_in)
+
+    # Store recording start time for making timestamps relative
+    recording_start_us = m.tmin  # Recording start in microseconds
+
+    # optional seek
+    if tstart > 0:
+        m.search(int(m.tmin + tstart * 1e6))
+
+    # compute absolute microsecond cutoff for tstop
+    end_us = None
+    if tstop is not None:
+        end_us = int(m.tmin + tstop * 1e6)
+
+    # viewer if requested
+    if display:
+        viewer = Viewer(tmin=m.tmin*1e-6, tmax=m.tmax*1e-6, zoom=1.0, rotate180=True)
+
+    # prepare on‐disk HDF5
+    if not display and not in_memory:
+        dtypes = {k: float for k in VIEW_DATA.union({'timestamp'})}
+        if export_aps: dtypes['aps_frame'] = (np.uint8, DVS_SHAPE)
+        if export_dvs: dtypes['dvs_frame'] = (np.int16, DVS_SHAPE)
+
+        f_out = h5py.File(out_path, "w")
+        for name, dt in dtypes.items():
+            if isinstance(dt, tuple):
+                f_out.create_dataset(name, shape=(0,) + dt[1],
+                                     maxshape=(None,) + dt[1],
+                                     dtype=dt[0], chunks=True,
+                                     compression="gzip", compression_opts=1)
+            else:
+                f_out.create_dataset(name, shape=(0,),
+                                     maxshape=(None,),
+                                     dtype=dt, chunks=True,
+                                     compression="gzip", compression_opts=1)
+
+        # Batch writing buffers for performance
+        BATCH_SIZE = 100
+        buffers = {name: [] for name in dtypes.keys()}
+
+        # Temporary buffers for matching steering to frames
+        temp_steering_timestamps = []
+        temp_steering_angles = []
+
+        def _flush_buffers():
+            """Flush all buffers to disk"""
+            for name, buf in buffers.items():
+                if len(buf) > 0:
+                    ds = f_out[name]
+                    old_size = ds.shape[0]
+                    new_size = old_size + len(buf)
+                    ds.resize(new_size, axis=0)
+                    ds[old_size:new_size] = np.array(buf)
+                    buf.clear()
+
+        def _append(name, data):
+            buffers[name].append(data)
+            if len(buffers[name]) >= BATCH_SIZE:
+                # Flush this specific buffer
+                buf = buffers[name]
+                ds = f_out[name]
+                old_size = ds.shape[0]
+                new_size = old_size + len(buf)
+                ds.resize(new_size, axis=0)
+                ds[old_size:new_size] = np.array(buf)
+                buf.clear()
+
+    # prepare in‐memory buffers
+    if in_memory:
+        timestamps = []
+        aps_frames = []
+        dvs_frames = []
+        steering_timestamps = []
+        steering_angles = []
+
+    half_window = binsize / 2.0
+    event_buffer = deque()
+    active_frames = deque()
+
+    def _prune_event_buffer(current_time):
+        min_time = current_time - half_window
+        while event_buffer and event_buffer[0]['ts'][-1] < min_time:
+            event_buffer.popleft()
+
+    def _finalize_ready_frames(current_time):
+        while active_frames and active_frames[0]['end'] <= current_time:
+            frame = active_frames.popleft()
+            if export_dvs:
+                dvs_frame = np.clip(frame['dvs'], -32768, 32767).astype(np.int16)
+            if in_memory:
+                timestamps.append(frame['ts'])
+                aps_frames.append(frame['aps'])
+                if export_dvs:
+                    dvs_frames.append(dvs_frame)
+            else:
+                _append('timestamp', frame['ts'])
+                _append('aps_frame', frame['aps'])
+                if export_dvs:
+                    _append('dvs_frame', dvs_frame)
+
+    # main loop
+    while m.has_data:
+        try:
+            sys_ts, d = m.get()
+        except Queue.Empty:
+            continue
+        if not d:
+            continue
+
+        # break when we exceed tstop
+        if end_us is not None and sys_ts > end_us:
+            break
+
+        # 1) display‐only
+        if display:
+            viewer.show(d, sys_ts)
+            continue
+
+        # 2) in‐memory
+        if in_memory:
+            etype = d.get('etype', d.get('name'))
+            if etype == 'special_event':
+                unpack_data(d)
+            elif etype == 'steering_wheel_angle':
+                # Convert to relative timestamp (seconds from recording start)
+                # sys_ts is already in seconds, recording_start_us is in microseconds
+                relative_ts = sys_ts - (recording_start_us * 1e-6)
+                steering_timestamps.append(relative_ts)
+                steering_angles.append(d.get('value', d.get('data')))
+            elif etype == 'frame_event' and export_aps:
+                _finalize_ready_frames(sys_ts - (recording_start_us * 1e-6))
+                unpack_data(d)  # Unpacks frame data
+                aps = (d['data'] // 256).astype(np.uint8)
+                # Use sys_ts (relative to recording start) for consistency with steering
+                relative_ts = sys_ts - (recording_start_us * 1e-6)
+                frame = {
+                    'ts': relative_ts,
+                    'start': relative_ts - half_window,
+                    'end': relative_ts + half_window,
+                    'aps': aps,
+                    'dvs': np.zeros(DVS_SHAPE, dtype=np.int32),
+                }
+                if export_dvs:
+                    for pkt in event_buffer:
+                        ts = pkt['ts']
+                        if ts[0] > relative_ts:
+                            break
+                        mask = (ts >= frame['start']) & (ts <= relative_ts)
+                        if mask.any():
+                            frame['dvs'] += raster_evts(pkt['data'][mask])
+                active_frames.append(frame)
+            elif etype == 'polarity_event' and export_dvs:
+                unpack_data(d)
+                packet_offset = sys_ts - d['timestamp']
+                event_ts = d['data'][:, 0] * 1e-6 + packet_offset - (recording_start_us * 1e-6)
+                event_buffer.append({'ts': event_ts, 'data': d['data']})
+                _prune_event_buffer(event_ts[-1])
+                for frame in active_frames:
+                    mask = (event_ts >= frame['start']) & (event_ts <= frame['end'])
+                    if mask.any():
+                        frame['dvs'] += raster_evts(d['data'][mask])
+                _finalize_ready_frames(event_ts[-1])
+            continue
+
+        # 3) on‐disk
+        etype = d.get('etype', d.get('name'))
+        if etype == 'special_event':
+            unpack_data(d)
+        elif etype == 'steering_wheel_angle':
+            # Collect steering data for later matching
+            # Convert to relative timestamp (seconds from recording start)
+            # sys_ts is already in seconds, recording_start_us is in microseconds
+            relative_ts = sys_ts - (recording_start_us * 1e-6)
+            temp_steering_timestamps.append(relative_ts)
+            temp_steering_angles.append(d.get('value', d.get('data')))
+        elif etype in VIEW_DATA and etype != 'steering_wheel_angle':
+            _append(etype, d.get('value', d.get('data')))
+        elif etype == 'frame_event' and export_aps:
+            _finalize_ready_frames(sys_ts - (recording_start_us * 1e-6))
+            unpack_data(d)  # Unpacks frame data
+            aps = (d['data'] // 256).astype(np.uint8)
+            # Use sys_ts (relative to recording start) for consistency with steering
+            relative_ts = sys_ts - (recording_start_us * 1e-6)
+            frame = {
+                'ts': relative_ts,
+                'start': relative_ts - half_window,
+                'end': relative_ts + half_window,
+                'aps': aps,
+                'dvs': np.zeros(DVS_SHAPE, dtype=np.int32),
+            }
+            if export_dvs:
+                for pkt in event_buffer:
+                    ts = pkt['ts']
+                    if ts[0] > relative_ts:
+                        break
+                    mask = (ts >= frame['start']) & (ts <= relative_ts)
+                    if mask.any():
+                        frame['dvs'] += raster_evts(pkt['data'][mask])
+            active_frames.append(frame)
+        elif etype == 'polarity_event' and export_dvs:
+            unpack_data(d)
+            packet_offset = sys_ts - d['timestamp']
+            event_ts = d['data'][:, 0] * 1e-6 + packet_offset - (recording_start_us * 1e-6)
+            event_buffer.append({'ts': event_ts, 'data': d['data']})
+            _prune_event_buffer(event_ts[-1])
+            for frame in active_frames:
+                mask = (event_ts >= frame['start']) & (event_ts <= frame['end'])
+                if mask.any():
+                    frame['dvs'] += raster_evts(d['data'][mask])
+            _finalize_ready_frames(event_ts[-1])
+
+    # teardown & returns
+    if display:
+        viewer.close()
+        return out_path
+
+    if in_memory:
+        _finalize_ready_frames(float('inf'))
+        # Match steering angles to frame timestamps using nearest-neighbor
+        frame_timestamps = np.array(timestamps)
+        steering_ts_arr = np.array(steering_timestamps)
+        steering_ang_arr = np.array(steering_angles)
+
+        matched_steering = np.zeros(len(frame_timestamps))
+        for i, frame_ts in enumerate(frame_timestamps):
+            # Find nearest steering sample
+            idx = np.argmin(np.abs(steering_ts_arr - frame_ts))
+            matched_steering[i] = steering_ang_arr[idx]
+
+        return (
+            frame_timestamps,                        # shape [N], sensor timestamps
+            np.stack(aps_frames, axis=0),           # shape [N,H,W]
+            np.stack(dvs_frames, axis=0),           # shape [N,H,W]
+            matched_steering                         # shape [N], matched to frames
+        )
+
+    # default on‐disk - flush remaining buffers before closing
+    _finalize_ready_frames(float('inf'))
+    _flush_buffers()
+
+    # Match steering angles to frame timestamps and write to file
+    if len(temp_steering_timestamps) > 0 and 'timestamp' in f_out:
+        frame_timestamps = f_out['timestamp'][:]
+        steering_ts_arr = np.array(temp_steering_timestamps)
+        steering_ang_arr = np.array(temp_steering_angles)
+
+        matched_steering = np.zeros(len(frame_timestamps))
+        for i, frame_ts in enumerate(frame_timestamps):
+            # Find nearest steering sample
+            idx = np.argmin(np.abs(steering_ts_arr - frame_ts))
+            matched_steering[i] = steering_ang_arr[idx]
+
+        # Write matched steering angles to file
+        if 'steering_wheel_angle' in f_out:
+            del f_out['steering_wheel_angle']
+        f_out.create_dataset('steering_wheel_angle', data=matched_steering,
+                           dtype=float, compression="gzip", compression_opts=1)
+
+    f_out.close()
+    return out_path
+
 
 def _flush_q(q):
-    ''' flush queue '''
+    """Flush a multiprocessing.Queue."""
     while True:
         try:
             q.get(timeout=1e-3)
@@ -93,7 +411,7 @@ class HDF5Stream(mp.Process):
     def run(self):
         while self.blocks_rem and not self.exit.is_set():
             blocks_read = 0
-            for k in self.blocks_rem.keys():
+            for k in list(self.blocks_rem.keys()):
                 if self.q[k].full():
                     time.sleep(1e-6)
                     continue
@@ -127,13 +445,31 @@ class HDF5Stream(mp.Process):
         return self.q[k].get(block, timeout)
 
     def _init_count(self, offset={}):
-        self.block_offset = {k: offset.get(k, 0) / CHUNK_SIZE
-                             for k in self.tables}
-        self.size = {k: len(self.f[k]['data']) - v * CHUNK_SIZE
-                     for k, v in self.block_offset.items()}
-        self.blocks = {k: v / CHUNK_SIZE for k, v in self.size.items()}
+        """
+        Initialize block offsets, sizes, and remaining blocks using integer division
+        so that multiprocessing.Value('L', v) always receives integers.
+        """
+        # how many complete chunks were skipped per stream
+        self.block_offset = {
+            k: offset.get(k, 0) // CHUNK_SIZE
+            for k in self.tables
+        }
+        # total number of samples remaining per stream
+        self.size = {
+            k: len(self.f[k]['data']) - off * CHUNK_SIZE
+            for k, off in self.block_offset.items()
+        }
+        # how many full CHUNK_SIZE blocks remain
+        self.blocks = {
+            k: sz // CHUNK_SIZE
+            for k, sz in self.size.items()
+        }
+        # wrap each block count in a multiprocessing.Value('L', int)
         self.blocks_rem = {
-            k: mp.Value('L', v) for k, v in self.blocks.items() if v}
+            k: mp.Value('L', v)
+            for k, v in self.blocks.items() if v
+        }
+
 
     def _init_time(self):
         self.ts_start = {}
@@ -350,166 +686,83 @@ class Viewer(Interface):
         self.min_dt = 1. / max_fps
 
     def show(self, d, t=None):
-        if DISPLAY:
-            # handle keyboad input
-            key_pressed = cv2.waitKey(1) & 0xFF  # http://www.asciitable.com/
-            if key_pressed != -1:
-                if key_pressed == ord('i'):  # 'i' pressed
-                    if self.display_color == 0:
-                        self.display_color = 255
-                    elif self.display_color == 255:
-                        self.display_color = 0
-                        self.display_info = not self.display_info
-                    print('rotated car info display')
-                elif key_pressed == ord('x'):  # exit
-                    print('exiting from x key')
-                    raise SystemExit
-                elif key_pressed == ord('f'):  # f (faster) key pressed
-                    self.min_dt = self.min_dt*1.2
-                    print('increased min_dt to ', self.min_dt, ' s')
-                    # self.playback_speed = min(self.playback_speed + 0.2, 5.0)
-                    # print('increased playback speed to ',self.playback_speed)
-                elif key_pressed == ord('s'):  # s (slower) key pressed
-                    self.min_dt = self.min_dt/1.2
-                    print('decreased min_dt to ', self.min_dt, ' s')
-                    # self.playback_speed = max(self.playback_speed - 0.2, 0.2)
-                    # print('decreased playback speed to ',self.playback_speed)
-                elif key_pressed == ord('b'):  # brighter
-                    self.dvs_contrast = max(1, self.dvs_contrast-1)
-                    print('increased DVS contrast to ', self.dvs_contrast,
-                        ' full scale event count')
-                elif key_pressed == ord('d'):  # brighter
-                    self.dvs_contrast = self.dvs_contrast+1
-                    print('decreased DVS contrast to ', self.dvs_contrast,
-                        ' full scale event count')
-                elif key_pressed == ord(' '):  # toggle paused
-                    self.paused = not self.paused
-                    print('decreased DVS contrast to ', self.dvs_contrast,
-                        ' full scale event count')
-            if self.paused:
-                while True:
-                    key_paused = cv2.waitKey(1) or 0xff
-                    if key_paused == ord(' '):
-                        self.paused = False
-                        break
+        if not DISPLAY:
+            return
 
-        ''' receive and handle single event '''
-        if 'etype' not in d:
-            d['etype'] = d['name']
-        etype = d['etype']
-        if not self.t_pre.get(etype):
-            self.t_pre[etype] = -1
-        self.count[etype] = self.count.get(etype, 0) + 1
-        if etype == 'frame_event' and \
-                time.time() - self.t_pre[etype] > self.min_dt:
-            if 'data' not in d:
-                unpack_data(d)
-            img = (d['data'] / 256).astype(np.uint8)
-            print("Frame {} {} {}".format(
-                img.shape, img.dtype, d["timestamp"]))
-            frame_data.resize(frame_data.shape[0]+1, axis=0)
-            frame_time.resize(frame_time.shape[0]+1, axis=0)
+        # figure out event type
+        etype = d.get('etype', d.get('name'))
 
-            frame_data[-1] = img
-            frame_time[-1, 0] = d["timestamp"]
+        # cache steering‐wheel angles as they arrive
+        if etype == 'steering_wheel_angle':
+            # d['data'] or d['value'] holds the scalar angle in degrees
+            self.cache['steering_wheel_angle'] = float(d.get('value', d.get('data')))
+            return
 
-            exported_data.flush()
-            del d
+        if etype == 'frame_event':
+            # unpack the uint16 image
+            unpack_data(d)
+            frame = (d['data'] // 256).astype(np.uint8)
 
-            #  if self.rotate180 is True:
-            #      # grab the dimensions of the image and calculate the center
-            #      # of the image
-            #      (h, w) = img.shape[:2]
-            #      center = (w / 2, h / 2)
-            #
-            #      # rotate the image by 180 degrees
-            #      M = cv2.getRotationMatrix2D(center, 180, 1.0)
-            #      img = cv2.warpAffine(img, M, (w, h))
-            #  if self.display_info:
-            #      self._plot_steering_wheel(img)
-            #      self._print(img, (50, 220), 'accelerator_pedal_position', '%')
-            #      self._print(img, (100, 220), 'brake_pedal_status',
-            #                  'brake', True)
-            #      self._print(img, (200, 220), 'vehicle_speed', 'km/h')
-            #      self._print(img, (300, 220), 'engine_speed', 'rpm')
-            #  if t is not None:
-            #      self._plot_timeline(img)
-            #  if self.zoom != 1:
-            #      img = cv2.resize(
-            #          img, None, fx=self.zoom, fy=self.zoom,
-            #          interpolation=cv2.INTER_CUBIC)
-            #  cv2.imshow('frame', img)
-            # cv2.waitKey(1)
-            self.t_pre[etype] = time.time()
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+            # rotate the image 180°
+            frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_180)
+
+            # overlay steering‐wheel angle if we have one
+            self._plot_steering_wheel(frame_bgr)
+
+            cv2.imshow('frame', frame_bgr)
+
         elif etype == 'polarity_event':
-            if 'data' not in d:
-                unpack_data(d)
+            # unpack polarity events into d['data']
+            unpack_data(d)
+            vox = raster_evts(d['data'])  # int16
 
-            print("Event data {} {} {}".format(
-                d["data"].shape, d["data"].dtype, d["timestamp"]))
+            # normalize to 0–255 for display
+            lo, hi = vox.min(), vox.max()
+            if hi > lo:
+                disp = ((vox - lo) * (255.0 / (hi - lo))).astype(np.uint8)
+            else:
+                disp = np.zeros_like(vox, dtype=np.uint8)
 
-            event_data.resize(event_data.shape[0]+d["data"].shape[0], axis=0)
-            event_data[-d["data"].shape[0]:] = d["data"]
+            cv2.imshow('polarity', disp)
 
-            exported_data.flush()
+        # let OpenCV process its window events
+        cv2.waitKey(1)
 
-            del d
 
-            # makes DVS image, but only from latest message
-            #  self.pol_img[d['data'][:, 2], d['data'][:, 1]] += \
-            #      (d['data'][:, 3]-.5)/self.dvs_contrast
-            #  if time.time() - self.t_pre[etype] > self.min_dt:
-            #      if self.zoom != 1:
-            #          self.pol_img = cv2.resize(
-            #                  self.pol_img, None,
-            #                  fx=self.zoom, fy=self.zoom,
-            #                  interpolation=cv2.INTER_CUBIC)
-            #          if self.rotate180 is True:
-            #              # grab the dimensions of the image and
-            #              # calculate the center
-            #              # of the image
-            #              (h, w) = self.pol_img.shape[:2]
-            #              center = (w / 2, h / 2)
-            #
-            #              # rotate the image by 180 degrees
-            #              M = cv2.getRotationMatrix2D(center, 180, 1.0)
-            #              self.pol_img = cv2.warpAffine(self.pol_img, M, (w, h))
-            #              if self.display_info:
-            #                  self._print_string(self.pol_img, (25, 25), "%.2fms"%(self.min_dt*1000))
-            #      cv2.imshow('polarity', self.pol_img)
-            #      # cv2.waitKey(1)
-            #      self.pol_img = 0.5 * np.ones(DVS_SHAPE)
-            self.t_pre[etype] = time.time()
-        elif etype in VIEW_DATA:
-            if 'data' not in d:
-                d['data'] = d['value']
-            self.cache[etype] = d['data']
-            self.t_pre[etype] = time.time()
-        if t is not None:
-            self._set_t(t)
 
     def _plot_steering_wheel(self, img):
         if 'steering_wheel_angle' not in self.cache:
             return
-        c, r = (173, 130), 65  # center, radius
+
+        # center and radius
+        cx, cy = (173, 130)
+        r = 65
+
+        # current angle in degrees
         a = self.cache['steering_wheel_angle']
-        a_rad = + a / 180. * np.pi + np.pi / 2
+        a_rad = a/180.0 * np.pi + np.pi/2
         if self.rotate180:
-            a_rad = np.pi-a_rad
-        t = (c[0] + int(np.cos(a_rad) * r), c[1] - int(np.sin(a_rad) * r))
-        cv2.line(img, c, t, self.display_color, 2, CV_AA)
-        cv2.circle(img, c, r, self.display_color, 1, CV_AA)
-        cv2.line(img, (c[0]-r+5, c[1]), (c[0]-r, c[1]),
-                 self.display_color, 1, CV_AA)
-        cv2.line(img, (c[0]+r-5, c[1]), (c[0]+r, c[1]),
-                 self.display_color, 1, CV_AA)
-        cv2.line(img, (c[0], c[1]-r+5), (c[0], c[1]-r),
-                 self.display_color, 1, CV_AA)
-        cv2.line(img, (c[0], c[1]+r-5), (c[0], c[1]+r),
-                 self.display_color, 1, CV_AA)
+            a_rad = np.pi - a_rad
+
+        # end point of the spoke
+        end_x = int(cx + np.cos(a_rad) * r)
+        end_y = int(cy - np.sin(a_rad) * r)
+
+        # draw a white circle and a green spoke
+        cv2.circle(img, (cx, cy), r, (255,255,255), 1, CV_AA)
+        cv2.line( img, (cx, cy), (end_x, end_y), (0,255,0), 2, CV_AA)
+
+        # put the text just below the wheel
         cv2.putText(
-            img, '%0.1f deg' % a,
-            (c[0]-35, c[1]+30), self.font, 0.4, self.display_color, 1, CV_AA)
+            img,
+            f"{a:.1f} deg",
+            (cx - 30, cy + r + 20),
+            self.font, 0.5, (0,0,255), 1, CV_AA
+        )
+
+
 
     def _print(self, img, pos, name, unit, autohide=False):
         if name not in self.cache:
@@ -630,97 +883,37 @@ def caer_event_from_row(row):
     return int(sys_ts) * 1e-6, unpack_data(d)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(formatter_class=RawTextHelpFormatter)
-    parser.add_argument('filename')
-    parser.add_argument('--rotate', '-r', type=bool, default=False,
-                        help="Rotate the scene 180 degrees if True, "
-                             "Otherwise False")
-    parser.add_argument('--display', type=int, default=1,
-                        help="whether to display data on the screen")
+def main_cli():
+    parser = argparse.ArgumentParser(description="Export DDD20 to homogeneous HDF5")
+    parser.add_argument('filename', help="Raw DDD20 file (.aedat or .hdf5)")
+    parser.add_argument('--binsize',    type=float, default=0.1,
+                        help="Time bin size in seconds (neg for fixed-event count)")
+    parser.add_argument('--export_aps', type=int,   choices=[0,1], default=1,
+                        help="1 to include APS frames")
+    parser.add_argument('--export_dvs', type=int,   choices=[0,1], default=1,
+                        help="1 to include DVS voxel frames")
+    parser.add_argument('--out_file',   default=None,
+                        help="Path to write exported HDF5 (defaults to filename + '.exported.hdf5')")
+    parser.add_argument('--tstart',     type=float, default=0.0,
+                        help="Start time in seconds relative to recording tmin")
+    parser.add_argument('--tstop',      type=float, default=None,
+                        help="Stop time in seconds relative to recording tmin")
+    parser.add_argument('--display',    type=int,   choices=[0,1], default=0,
+                        help="1 to show OpenCV windows during export (not recommended for headless)")
     args = parser.parse_args()
 
-    fname = args.filename
-    DISPLAY = args.display
+    out = export_sequence(
+        args.filename,
+        out_path=args.out_file,
+        binsize=args.binsize,
+        export_aps=bool(args.export_aps),
+        export_dvs=bool(args.export_dvs),
+        display=bool(args.display),
+        tstart=args.tstart,
+        tstop=args.tstop
+    )
+    print(f"[DONE] Exported to {out}")
 
-    # exported file
-    file_abs_path = os.path.abspath(fname)
-    # lazy export naming fashion
-    export_file_path = file_abs_path+".exported.hdf5"
 
-    exported_data = h5py.File(export_file_path, "w")
-    frame_data = exported_data.create_dataset(
-        name="frame",
-        shape=(0, 260, 346),
-        maxshape=(None, 260, 346),
-        dtype="uint8")
-    frame_time = exported_data.create_dataset(
-        name="frame_ts",
-        shape=(0, 1),
-        maxshape=(None, 1),
-        dtype="float32")
-    event_data = exported_data.create_dataset(
-        name="event",
-        shape=(0, 4),
-        maxshape=(None, 4),
-        dtype="uint32")
-
-    c = Controller(fname,)
-    m = MergedStream(HDF5Stream(fname, VIEW_DATA))
-    c._search_callback = m.search
-    t = time.time()
-    t_pre = 0
-    t_offset = 0
-    r180 = args.rotate
-    #  r180arg = "-r180"
-
-    print('recording duration', (m.tmax - m.tmin) * 1e-6, 's')
-    # direct skip by command line
-    # parse second argument
-    try:
-        second_opt = args.start
-        n_, type_ = second_opt[:-1], second_opt[-1]
-        if type_ == '%':
-            m.search((m.tmax - m.tmin) * 1e-2 * float(n_) + m.tmin)
-        elif type_ == 's':
-            m.search(float(n_) * 1e6 + m.tmin)
-    except:
-        pass
-    v = Viewer(tmin=m.tmin * 1e-6, tmax=m.tmax * 1e-6, 
-                    zoom=1.41, rotate180=r180, update_callback=c.update)
-    # run main loop
-    ts_reset = False
-    while m.has_data:
-        try:
-            sys_ts, d = m.get()
-        except Queue.Empty:
-            continue
-        if not d:
-            continue
-        if d['etype'] == 'timestamp_reset':
-            ts_reset = True
-            continue
-        if not d['etype'] in {'frame_event', 'polarity_event'}:
-            v.show(d)
-            continue
-        if d['timestamp'] < t_pre:
-            print('[WARN] negative dt detected!')
-        t_pre = d['timestamp']
-        if ts_reset:
-            print('resetting timestamp')
-            t_offset = 0
-            ts_reset = False
-        if not t_offset:
-            t_offset = time.time() - d['timestamp']
-            print('setting offset', t_offset)
-        t_sleep = max(d['timestamp'] - time.time() + t_offset, 0)
-        time.sleep(t_sleep)
-        v.show(d, sys_ts)
-        #  if time.time() - t > 1:
-        #      print(chr(27) + "[2J")
-        #      t = time.time()
-        #      print('fps:\n', '\n'.join(
-        #          ['  %s %s' % (
-        #           k.ljust(20), v_) for k, v_ in v.count.items()]))
-        #      v.count = {k: 0 for k in v.count}
-    exported_data.close()
+if __name__ == '__main__':
+    main_cli()

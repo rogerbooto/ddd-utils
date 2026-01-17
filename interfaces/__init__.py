@@ -1,3 +1,6 @@
 
 import interfaces.caer
-import interfaces.oxc as openxc
+try:
+    import interfaces.oxc as openxc
+except Exception:
+    openxc = None

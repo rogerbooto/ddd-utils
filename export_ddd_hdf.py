@@ -11,9 +11,10 @@ geometry and the OpenXC field set are selected with ``--dataset {ddd17,ddd20}``
 (or an explicit ``--sensor``); the exporter is robust to OpenXC channels that are
 absent from a given recording and stamps dataset/sensor provenance on the output.
 
-NOTE: only the raw caer HDF5 container is read here. DDD17's ``run1_test`` is
-distributed as raw ``.aedat`` and requires a separate aedat decoder (not part of
-this exporter) before it can be exported.
+NOTE: ``export_sequence`` reads only the raw caer HDF5 container. DDD17's
+``run1_test`` is distributed as raw ``.aedat`` (AEDAT 2.0) and is decoded by the
+sibling ``aedat.py``; the top-level ``export()`` dispatcher here routes ``.aedat``
+inputs there and ``.hdf5`` inputs to ``export_sequence``.
 
 Author: Yuhuang Hu
 Email : yuhuang.hu@ini.uzh.ch
@@ -475,6 +476,33 @@ def export_sequence(
 
     f_out.close()
     return out_path
+
+
+def export(input_path, **kwargs):
+    """Top-level dispatcher: route an input file to the right export path.
+
+    Routing is by magic bytes first, extension second:
+      * first bytes ``#!AER-DAT`` or a ``.aedat`` extension -> AEDAT 2.0 decoder
+        (:func:`aedat.export_aedat_sequence`); APS + DVS only, no OpenXC steering.
+      * ``.hdf5`` / ``.h5`` (or anything else) -> the caer-HDF5
+        :func:`export_sequence` (the verified DDD17/DDD20 path, unchanged).
+
+    ``kwargs`` are forwarded to the chosen exporter; pass only the args that
+    exporter accepts (e.g. ``binsize``, ``out_path``, ``dataset``, ``tstop``).
+    The AEDAT path is imported lazily to avoid an import cycle (aedat.py imports
+    ``raster_evts`` from this module).
+    """
+    magic = b''
+    try:
+        with open(input_path, 'rb') as _f:
+            magic = _f.read(9)
+    except OSError:
+        pass
+    is_aedat = magic.startswith(b'#!AER-DAT') or str(input_path).lower().endswith('.aedat')
+    if is_aedat:
+        from aedat import export_aedat_sequence
+        return export_aedat_sequence(input_path, **kwargs)
+    return export_sequence(input_path, **kwargs)
 
 
 def _flush_q(q):

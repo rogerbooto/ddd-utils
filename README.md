@@ -123,6 +123,42 @@ Added now is option to turn off the display (thanks youkaichao) so that issue #4
 ```
 python export_ddd_hdf.py filename --display 0
 ```
+
+## AEDAT 2.0 input support (DDD17 `run1_test`)
+
+Most of DDD17/DDD20 ships as caer-packed HDF5, but DDD17's **`run1_test`** split is
+distributed as raw jAER **AEDAT 2.0** (`.aedat`). `aedat.py` decodes those files
+(DAVIS346B, APS + DVS) into the **same** homogeneous HDF5 layout as the caer path:
+
+```python
+from aedat import export_aedat_sequence
+export_aedat_sequence("run1_test/....aedat", out_path="out.hdf5", binsize=0.1)
+```
+
+or via the magic-byte/extension dispatcher:
+
+```python
+from export_ddd_hdf import export
+export("run1_test/....aedat")   # -> AEDAT path;  export("rec....hdf5") -> caer path
+```
+
+Output datasets: `aps_frame` (N,260,346) uint8, `dvs_frame` (N,260,346) int16,
+`timestamp` (N,) float, with provenance attrs (`source_format='aedat2.0'`, `aechip`,
+`orientation`, …).
+
+Notes / scope:
+- **AEDAT 2.0 only** (DAVIS346B). A 3.x/4.x header raises `NotImplementedError`
+  (use `dv-processing`).
+- **No steering / OpenXC.** The `run1_test` `.aedat` has no CAN payload (steering,
+  throttle and GPS are in separate `.dat` traces), so no steering dataset is written
+  (`has_steering=False`). Do not compare it against the CAN-bearing recordings for
+  steering supervision.
+- **Orientation** is sensor-native (upside-down), pixel-consistent with the caer/DDD20
+  exports; `orient='upright'` is available for visualisation only.
+- The address bit-layout is a **clean-room** reconstruction from the jAER
+  `Davis346`/`DavisChip` (GPL) and AedatTools `ImportAedatDataVersion1or2` (unlicensed)
+  specifications — used as reference only, no source copied — and was empirically
+  verified against a real `run1_test` recording.
 ## Exporting to frame-based representation
 
 ```bash

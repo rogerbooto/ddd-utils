@@ -10,7 +10,7 @@ records the significant changes this fork makes, as required by the LGPL.
 - **Python 3 port.** `queue`/`Queue` compatibility, an `interfaces.oxc` import guard, and
   related fixes so the viewer and exporter run under Python 3.
 
-- **`export_ddd20_hdf.py` rewrite.** Per-frame homogeneous HDF5 export
+- **`export_ddd_hdf.py` rewrite.** Per-frame homogeneous HDF5 export
   (`aps_frame` / `dvs_frame` / OpenXC channels), batched HDF5 writes, an in-memory mode,
   and steering-angle-to-frame nearest-neighbour matching (timestamp synchronization).
 

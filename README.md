@@ -4,7 +4,7 @@
 > [SensorsINI/ddd20-utils](https://github.com/SensorsINI/ddd20-utils) by J. Binas, Y. Hu,
 > D. Neil, S.-C. Liu and T. Delbruck. It retains the upstream **GNU LGPL v3** license and
 > all original attribution (see the citations below). The exporter
-> (`export_ddd20_hdf.py`) now serves **both DDD17 and DDD20** via `--dataset {ddd17,ddd20}`.
+> (`export_ddd_hdf.py`) now serves **both DDD17 and DDD20** via `--dataset {ddd17,ddd20}`.
 > See [CHANGES.md](CHANGES.md) for the full list of modifications. All credit for the
 > original dataset, recording tools and viewer belongs to the upstream authors.
 
@@ -107,7 +107,7 @@ We prepared a script that can convert the original HDF5 recording into a
 nicer data strcture that user can directly work on. __However, this file will not contain the car CAN bus steering/throttle/GPS, etc.__
 
 ```bash
-$ python export_ddd20_hdf.py [-h] [--rotate ROTATE] filename
+$ python export_ddd_hdf.py [-h] [--rotate ROTATE] filename
 ```
 
 The newly exported file is an HDF5 file that is called `filename.exported.hdf5`.
@@ -121,7 +121,7 @@ frame_ts: (M frames x 1)
 ```
 Added now is option to turn off the display (thanks youkaichao) so that issue #4 can be resolved by simply adding the option: 
 ```
-python export_ddd20_hdf.py filename --display 0
+python export_ddd_hdf.py filename --display 0
 ```
 ## Exporting to frame-based representation
 

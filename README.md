@@ -1,4 +1,12 @@
-# DDD20 End-to-End Event Camera Driving Dataset
+# DDD17 + DDD20 utilities
+
+> **Maintained fork.** This is a Python-3, DDD17+DDD20 fork of the original
+> [SensorsINI/ddd20-utils](https://github.com/SensorsINI/ddd20-utils) by J. Binas, Y. Hu,
+> D. Neil, S.-C. Liu and T. Delbruck. It retains the upstream **GNU LGPL v3** license and
+> all original attribution (see the citations below). The exporter
+> (`export_ddd20_hdf.py`) now serves **both DDD17 and DDD20** via `--dataset {ddd17,ddd20}`.
+> See [CHANGES.md](CHANGES.md) for the full list of modifications. All credit for the
+> original dataset, recording tools and viewer belongs to the upstream authors.
 
 See https://sites.google.com/view/davis-driving-dataset-2020/home for details.
 

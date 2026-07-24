@@ -1,15 +1,28 @@
-'''Export DDD20 recording to homogeneous format.
+'''Export a DDD17 / DDD20 recording to homogeneous format.
 
-The DDD20 HDF recordings saves data in a custom format that
-are not friendly to batch processing.
-In this script, I modified the viewer script to export the data
-into a newly created HDF5 that has nicer user experience.
+The raw DDD HDF recordings save data in a custom (caer) format that is not
+friendly to batch processing. This script exports the data into a newly created
+HDF5 with a nicer, per-frame layout (aps_frame / dvs_frame / OpenXC channels).
+
+DDD17 (Binas et al. 2017) and DDD20 (Hu et al. 2020) were recorded with the same
+DAVIS346B sensor (260x346), use the same caer event packing, and expose the same
+OpenXC channel names, so a single export path serves both datasets. The sensor
+geometry and the OpenXC field set are selected with ``--dataset {ddd17,ddd20}``
+(or an explicit ``--sensor``); the exporter is robust to OpenXC channels that are
+absent from a given recording and stamps dataset/sensor provenance on the output.
+
+NOTE: only the raw caer HDF5 container is read here. DDD17's ``run1_test`` is
+distributed as raw ``.aedat`` and requires a separate aedat decoder (not part of
+this exporter) before it can be exported.
 
 Author: Yuhuang Hu
 Email : yuhuang.hu@ini.uzh.ch
 
 Experimental viewer for DAVIS + OpenXC data
 Author: J. Binas <jbinas@gmail.com>, 2017
+
+DDD17/DDD20 generalization (dataset/sensor parameterization, missing-channel
+robustness, provenance) contributed by Roger Booto Tokime, 2026.
 
 This software is released under the
 GNU LESSER GENERAL PUBLIC LICENSE Version 3.
@@ -31,6 +44,59 @@ from interfaces.caer import DVS_SHAPE, unpack_header, unpack_data
 CHUNK_SIZE = 128
 
 DISPLAY = False # whether to turn on display. setting DISPLAY=False makes our lives easier in headless servers
+
+# --- DDD17 + DDD20 generalization -------------------------------------------
+# Both datasets were recorded with the DAVIS346B (260x346). The presets below
+# make the sensor geometry an explicit, checked parameter rather than a buried
+# module global; a future DAVIS240C recording is one table entry away (and would
+# additionally require interfaces/caer.py:DVS_SHAPE to match — see the loud check
+# in export_sequence, since unpack_frame reshapes to that constant).
+SENSOR_PRESETS = {
+    'davis346b': (260, 346),   # DDD17 + DDD20
+    'davis240c': (180, 240),   # reserved for future DAVIS240C recordings
+}
+DATASET_SENSOR = {
+    'ddd17': 'davis346b',
+    'ddd20': 'davis346b',
+}
+
+
+def resolve_dvs_shape(dataset=None, sensor=None):
+    """Resolve the (H, W) DVS/APS geometry from a dataset name or explicit sensor.
+
+    Precedence: explicit ``sensor`` > ``dataset`` preset > interfaces.caer.DVS_SHAPE.
+    Raises ``ValueError`` on an unknown dataset/sensor so a typo fails loudly
+    instead of silently exporting mis-shaped frames.
+    """
+    if sensor is not None:
+        key = str(sensor).lower()
+        if key not in SENSOR_PRESETS:
+            raise ValueError(f"Unknown sensor {sensor!r}; known: {sorted(SENSOR_PRESETS)}")
+        return SENSOR_PRESETS[key]
+    if dataset is not None:
+        key = str(dataset).lower()
+        if key not in DATASET_SENSOR:
+            raise ValueError(f"Unknown dataset {dataset!r}; known: {sorted(DATASET_SENSOR)}")
+        return SENSOR_PRESETS[DATASET_SENSOR[key]]
+    return DVS_SHAPE
+
+
+def _present_tables(input_path, wanted):
+    """Intersect the wanted OpenXC/dvs tables with those actually in the recording.
+
+    DDD17 and DDD20 expose the same channel names, but individual recordings may
+    omit a channel. Skipping absent channels (with a note) keeps the exporter from
+    crashing on a KeyError deep inside the streaming process. 'dvs' is mandatory.
+    """
+    with h5py.File(input_path, 'r') as _f:
+        keys = set(_f.keys())
+    present = {k for k in wanted if k in keys}
+    if 'dvs' not in present:
+        raise ValueError(f"{input_path}: no 'dvs' group found — not a raw DDD caer recording")
+    missing = set(wanted) - present
+    if missing:
+        print(f"[export] note: OpenXC channels absent from recording, skipped: {sorted(missing)}")
+    return present
 
 #  exported_h5_path = os.path.join(
 #      os.environ["HOME"], "data", "DDD19", "exported.h5")
@@ -65,25 +131,27 @@ VIEW_DATA = {
 # this changed in version 3
 CV_AA = cv2.LINE_AA if int(cv2.__version__[0]) > 2 else cv2.CV_AA
 
-def raster_evts(data):
+def raster_evts(data, dvs_shape=None):
     """
     Bin polarity events into a 2D voxel grid:
       data[:,0] = timestamps (µs)
       data[:,1] = y coordinates
       data[:,2] = x coordinates
       data[:,3] = polarity (0 or 1)
-    Returns an int16 array of shape DVS_SHAPE with (on − off) counts.
+    Returns an int16 array of shape ``dvs_shape`` (defaults to DVS_SHAPE) with
+    (on − off) counts.
     """
-    _histrange = [(0, v) for v in DVS_SHAPE]
+    shape = tuple(dvs_shape) if dvs_shape is not None else DVS_SHAPE
+    _histrange = [(0, v) for v in shape]
     pol_on  = data[:,3] == 1
     pol_off = ~pol_on
     img_on, _, _  = np.histogram2d(
         data[pol_on, 2], data[pol_on, 1],
-        bins=DVS_SHAPE, range=_histrange
+        bins=shape, range=_histrange
     )
     img_off, _, _ = np.histogram2d(
         data[pol_off,2], data[pol_off,1],
-        bins=DVS_SHAPE, range=_histrange
+        bins=shape, range=_histrange
     )
     return (img_on - img_off).astype(np.int16)
 
@@ -104,22 +172,42 @@ def export_sequence(
     display: bool = False,
     in_memory: bool = False,
     tstart: float = 0.0,
-    tstop: float = None
+    tstop: float = None,
+    dataset: str = None,
+    dvs_shape=None,
 ):
     """
     Three modes:
       * display=True        → live OpenCV viewer, no on-disk/output
       * in_memory=True      → collect into RAM and return arrays
       * neither (default)   → write an HDF5 to out_path and return its path
+
+    ``dataset`` ({'ddd17','ddd20'}) selects the sensor geometry preset; pass an
+    explicit ``dvs_shape=(H, W)`` to override. Defaults preserve the historical
+    DDD20 behaviour (DAVIS346B = (260, 346)).
     """
     global DISPLAY
     DISPLAY = bool(display)
 
+    # Resolve sensor geometry. DDD17 and DDD20 are both DAVIS346B = (260, 346).
+    shape = tuple(dvs_shape) if dvs_shape is not None else tuple(resolve_dvs_shape(dataset))
+    # APS frames are decoded by interfaces/caer.py:unpack_frame, which reshapes to
+    # the module-level DVS_SHAPE. If the requested geometry disagrees, exported APS
+    # frames would be silently mis-shaped (or crash on reshape) — fail loudly.
+    if shape != tuple(DVS_SHAPE):
+        raise ValueError(
+            f"Requested DVS shape {shape} != interfaces.caer.DVS_SHAPE {tuple(DVS_SHAPE)}. "
+            "APS frames are decoded via interfaces/caer.py:unpack_frame, which reshapes to "
+            "that module-level constant; set DVS_SHAPE/SENSOR there to match before exporting "
+            "a different sensor. (DDD17 and DDD20 are both DAVIS346B = (260, 346).)"
+        )
+
     if out_path is None:
         out_path = input_path + ".exported.hdf5"
 
-    # open streams
-    f_in = HDF5Stream(input_path, VIEW_DATA)
+    # open streams — skip OpenXC channels absent from this particular recording
+    present = _present_tables(input_path, VIEW_DATA)
+    f_in = HDF5Stream(input_path, present)
     m    = MergedStream(f_in)
 
     # Store recording start time for making timestamps relative
@@ -140,11 +228,17 @@ def export_sequence(
 
     # prepare on‐disk HDF5
     if not display and not in_memory:
-        dtypes = {k: float for k in VIEW_DATA.union({'timestamp'})}
-        if export_aps: dtypes['aps_frame'] = (np.uint8, DVS_SHAPE)
-        if export_dvs: dtypes['dvs_frame'] = (np.int16, DVS_SHAPE)
+        dtypes = {k: float for k in present.union({'timestamp'})}
+        if export_aps: dtypes['aps_frame'] = (np.uint8, shape)
+        if export_dvs: dtypes['dvs_frame'] = (np.int16, shape)
 
         f_out = h5py.File(out_path, "w")
+        # provenance: which dataset/sensor/geometry produced this export
+        f_out.attrs['dataset'] = str(dataset) if dataset else 'ddd20'
+        f_out.attrs['sensor'] = 'DAVIS346B'
+        f_out.attrs['dvs_shape'] = np.asarray(shape, dtype=np.int32)
+        f_out.attrs['binsize_s'] = float(binsize)
+        f_out.attrs['exporter'] = 'ddd20-utils/export_ddd20_hdf.py (DDD17+DDD20 generalized)'
         for name, dt in dtypes.items():
             if isinstance(dt, tuple):
                 f_out.create_dataset(name, shape=(0,) + dt[1],
@@ -261,7 +355,7 @@ def export_sequence(
                     'start': relative_ts - half_window,
                     'end': relative_ts + half_window,
                     'aps': aps,
-                    'dvs': np.zeros(DVS_SHAPE, dtype=np.int32),
+                    'dvs': np.zeros(shape, dtype=np.int32),
                 }
                 if export_dvs:
                     for pkt in event_buffer:
@@ -270,7 +364,7 @@ def export_sequence(
                             break
                         mask = (ts >= frame['start']) & (ts <= relative_ts)
                         if mask.any():
-                            frame['dvs'] += raster_evts(pkt['data'][mask])
+                            frame['dvs'] += raster_evts(pkt['data'][mask], shape)
                 active_frames.append(frame)
             elif etype == 'polarity_event' and export_dvs:
                 unpack_data(d)
@@ -281,7 +375,7 @@ def export_sequence(
                 for frame in active_frames:
                     mask = (event_ts >= frame['start']) & (event_ts <= frame['end'])
                     if mask.any():
-                        frame['dvs'] += raster_evts(d['data'][mask])
+                        frame['dvs'] += raster_evts(d['data'][mask], shape)
                 _finalize_ready_frames(event_ts[-1])
             continue
 
@@ -296,7 +390,7 @@ def export_sequence(
             relative_ts = sys_ts - (recording_start_us * 1e-6)
             temp_steering_timestamps.append(relative_ts)
             temp_steering_angles.append(d.get('value', d.get('data')))
-        elif etype in VIEW_DATA and etype != 'steering_wheel_angle':
+        elif etype in present and etype != 'steering_wheel_angle':
             _append(etype, d.get('value', d.get('data')))
         elif etype == 'frame_event' and export_aps:
             _finalize_ready_frames(sys_ts - (recording_start_us * 1e-6))
@@ -309,7 +403,7 @@ def export_sequence(
                 'start': relative_ts - half_window,
                 'end': relative_ts + half_window,
                 'aps': aps,
-                'dvs': np.zeros(DVS_SHAPE, dtype=np.int32),
+                'dvs': np.zeros(shape, dtype=np.int32),
             }
             if export_dvs:
                 for pkt in event_buffer:
@@ -318,7 +412,7 @@ def export_sequence(
                         break
                     mask = (ts >= frame['start']) & (ts <= relative_ts)
                     if mask.any():
-                        frame['dvs'] += raster_evts(pkt['data'][mask])
+                        frame['dvs'] += raster_evts(pkt['data'][mask], shape)
             active_frames.append(frame)
         elif etype == 'polarity_event' and export_dvs:
             unpack_data(d)
@@ -329,7 +423,7 @@ def export_sequence(
             for frame in active_frames:
                 mask = (event_ts >= frame['start']) & (event_ts <= frame['end'])
                 if mask.any():
-                    frame['dvs'] += raster_evts(d['data'][mask])
+                    frame['dvs'] += raster_evts(d['data'][mask], shape)
             _finalize_ready_frames(event_ts[-1])
 
     # teardown & returns
@@ -884,8 +978,16 @@ def caer_event_from_row(row):
 
 
 def main_cli():
-    parser = argparse.ArgumentParser(description="Export DDD20 to homogeneous HDF5")
-    parser.add_argument('filename', help="Raw DDD20 file (.aedat or .hdf5)")
+    parser = argparse.ArgumentParser(
+        description="Export a raw DDD17/DDD20 caer HDF5 recording to homogeneous HDF5",
+        formatter_class=RawTextHelpFormatter,
+    )
+    parser.add_argument('filename', help="Raw DDD17/DDD20 recording (.hdf5, caer format)")
+    parser.add_argument('--dataset', choices=sorted(DATASET_SENSOR), default='ddd20',
+                        help="Source dataset; selects the sensor geometry preset "
+                             "(ddd17 and ddd20 are both DAVIS346B = 260x346). Default: ddd20.")
+    parser.add_argument('--sensor', choices=sorted(SENSOR_PRESETS), default=None,
+                        help="Explicit sensor override (takes precedence over --dataset).")
     parser.add_argument('--binsize',    type=float, default=0.1,
                         help="Time bin size in seconds (neg for fixed-event count)")
     parser.add_argument('--export_aps', type=int,   choices=[0,1], default=1,
@@ -902,6 +1004,9 @@ def main_cli():
                         help="1 to show OpenCV windows during export (not recommended for headless)")
     args = parser.parse_args()
 
+    # explicit --sensor wins; otherwise the --dataset preset resolves the geometry
+    shape = resolve_dvs_shape(dataset=args.dataset, sensor=args.sensor)
+
     out = export_sequence(
         args.filename,
         out_path=args.out_file,
@@ -910,7 +1015,9 @@ def main_cli():
         export_dvs=bool(args.export_dvs),
         display=bool(args.display),
         tstart=args.tstart,
-        tstop=args.tstop
+        tstop=args.tstop,
+        dataset=args.dataset,
+        dvs_shape=shape,
     )
     print(f"[DONE] Exported to {out}")
 
